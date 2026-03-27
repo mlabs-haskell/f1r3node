@@ -1,5 +1,5 @@
 use crate::rust::interpreter::chromadb_service::{
-    CollectionEntries, Metadata, SharedChromaDBService
+    CollectionEntries, Metadata, SharedChromaDBService,
 };
 use crate::rust::interpreter::rho_type::{Extractor, RhoList, RhoNil};
 
@@ -1663,7 +1663,10 @@ impl SystemProcesses {
             return Ok(previous_output);
         }
 
-        let meta = self.chromadb_service.get_collection_meta(&collection_name).await?;
+        let meta = self
+            .chromadb_service
+            .get_collection_meta(&collection_name)
+            .await?;
         let result_par = match meta {
             None => RhoNil::create_par(),
             Some(inner) => inner.into(),
@@ -1735,7 +1738,8 @@ impl SystemProcesses {
             return Ok(previous_output);
         }
 
-        let res = self.chromadb_service
+        let res = self
+            .chromadb_service
             .query(
                 &collection_name,
                 doc_texts.iter().map(|s| s.as_ref()).collect(),
@@ -1815,11 +1819,43 @@ impl SystemProcesses {
         // Perform the compilation
         let output = petta_compile(&metta_code)?;
 
-        // Parse the output
-        let result_par = RhoString::create_par(output);
+        // Extract compiled output from all the compiler output
+        let compiled_output = SystemProcesses::extract_output(output)?;
+
+        let result_par = RhoString::create_par(compiled_output.into());
         let output = vec![result_par];
         produce(&output, &ack).await?;
         Ok(output)
+    }
+
+    // MeTTa for now only generates terminal output with irrelevant formatting
+    // and information, which we need to remove.
+    fn extract_output(raw_output: String) -> Result<String, InterpreterError> {
+        let possible_headers = [
+            "\x1b[33m--> prolog clause -->\n",
+            "\x1b[33m-->  prolog goal  -->\x1b[35m \n",
+            "\x1b[33m--> metta sexpr -->\n\x1b[36m",
+        ];
+        let (_, after_header) = {
+            let mut after = Err(InterpreterError::SwiplError(
+                "Could not find header of compiled output".into(),
+            ));
+            for header in possible_headers {
+                let split = raw_output.split_once(header);
+                match split {
+                    Some(a) => after = Ok(a),
+                    None => continue,
+                }
+            }
+            after?
+        };
+        let end = "\n\x1b[33m^^^^^^^^^^^^^^^^^^^^^^\n\x1b[0m";
+        let (result, _) = after_header
+            .split_once(end)
+            .ok_or(InterpreterError::SwiplError(
+                "Could not find expected end of compiled clauses".into(),
+            ))?;
+        Ok(result.into())
     }
 
     // SWIPL section end
