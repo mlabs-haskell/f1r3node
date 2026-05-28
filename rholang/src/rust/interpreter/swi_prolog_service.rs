@@ -1,18 +1,65 @@
-use std::io::Write;
-use std::path::PathBuf;
-use std::{env, time::Duration};
-// use std::process::Command;
-use tokio::process::Command;
-
+use crypto::rust::hash::blake2b256::Blake2b256;
+use hex::ToHex;
 use models::rhoapi::Par;
 use serde_json::Value;
-use tempfile::NamedTempFile;
+use std::fs::{create_dir_all, remove_dir_all, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::{env, time::Duration};
+use tokio::process::Command;
 
 use crate::rust::interpreter::rho_type::{
     RhoBoolean, RhoList, RhoMap, RhoNil, RhoNumber, RhoString,
 };
 
 use super::errors::InterpreterError;
+
+// TODO: Place `petta_sessions` in location where f1r3node state is persisted.
+// A PettaSession holds the MeTTa program to execute and any continuations created
+// during its execution. It must be cleaned up whenever execution succeeds or is
+// aborted due to an `InterpreterError`. It must outlive other problems such as
+// power outages or the f1r3node process being killed.
+struct PettaSession {
+    path: PathBuf,
+}
+
+impl PettaSession {
+    fn create(metta_source: &str) -> Result<Self, InterpreterError> {
+        let hash: String = Blake2b256::hash(Vec::from(metta_source.as_bytes())).encode_hex_upper();
+        let petta_sessions_path = Path::new("petta_sessions");
+        let this_session_path = petta_sessions_path.join(Path::new(hash.as_str()));
+        let this_program_path = this_session_path.join(Path::new("program.metta"));
+        // Create sessions dir
+        create_dir_all(&this_session_path)?;
+        // Copy wrapped program into session dir
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(this_program_path)?;
+        write_metta_program(metta_source, file)?;
+        // Symlink repos folder. `git-import!` in MeTTa downloads repositories
+        // into the current working directory, but this will happen constantly
+        // because session folders are transient.
+        // TODO: Add a standard location for downloaded repositories.
+        let repos_path = Path::new("../../repos");
+        let repos_symlink = this_session_path.join(Path::new("repos"));
+        std::os::unix::fs::symlink(repos_path, repos_symlink)?;
+        Ok(Self {
+            path: this_session_path,
+        })
+    }
+}
+
+impl Drop for PettaSession {
+    fn drop(&mut self) {
+        remove_dir_all(&self.path).unwrap_or_else(|e| {
+            println!(
+                "Failed to delete session folder {:#?}. Error {:#?}",
+                self.path, e
+            )
+        });
+    }
+}
 
 /// Executes MeTTa code through the PeTTa (SWI-Prolog) interpreter and returns the result as a Rholang Par.
 ///
@@ -82,20 +129,9 @@ use super::errors::InterpreterError;
 ///
 /// - [`system_processes::swipl_execute_petta`] - System process wrapper for Rholang contracts
 /// - [`value_to_par`] - JSON to Par conversion logic
-pub async fn petta_execute(metta_code: &str) -> Result<Par, InterpreterError> {
-    // Write the MeTTa code to a temp file
-    let mut metta_file = NamedTempFile::new()
-        .map_err(|_| InterpreterError::SwiplError("Can't open temp file".into()))?;
-    metta_file
-        .write(metta_code.as_bytes())
-        .map_err(|_| InterpreterError::SwiplError("Can't write MeTTa code to temp file".into()))?;
 
-    let metta_file_path = metta_file
-        .path()
-        .to_str()
-        .ok_or(InterpreterError::SwiplError(
-            "Can't convert metta_file path to string".into(),
-        ))?;
+pub async fn petta_execute(metta_code: &str) -> Result<Par, InterpreterError> {
+    let session = PettaSession::create(metta_code)?;
 
     // Get the path to PeTTa
     let metta_module_path: PathBuf = {
@@ -107,11 +143,20 @@ pub async fn petta_execute(metta_code: &str) -> Result<Par, InterpreterError> {
         return Err(InterpreterError::SwiplError("Can't find PeTTa.".into()));
     }
 
+    // We need to do some manual setup before running the MeTTa program. Some of
+    // these steps are done by the main entry point of the PeTTa program, but others
+    // are not.
+    //
+    // We also run some additional code after the evaluation of the MeTTa program
+    // to get useful output that we can parse.
     let goal = format!(
         r#"assertz(silent(true)),
-           load_metta_file('{metta_file_path}', Results),
+           working_directory(_, '{session_path}'),
+           assertz(working_dir('{session_path}')),
+           load_metta_file('program.metta', Results),
            use_module(library(json)),
-           json_write_dict(current_output, #{{results:Results}})."#
+           json_write_dict(current_output, #{{results:Results}})."#,
+        session_path = session.path.display()
     );
 
     // TODO: Make this a configuration parameter
@@ -247,6 +292,29 @@ fn value_to_par(v: Value) -> Result<Par, InterpreterError> {
         }
     }
 }
+
+// This function wraps the given MeTTa program to support snapshots and persists
+// the wrapped version of the program to the given file.
+fn write_metta_program(metta_code: &str, mut file: File) -> Result<(), std::io::Error> {
+    let prelude = r#"!(progn
+    (import! &self (library lib_import))
+    (call (git-import! "https://github.com/rmgaray/petta_lib_snapshot.git"))
+    (import! &self (library lib_snapshot))
+    (empty)
+)
+"#;
+    let main_wrapper = r#"
+!(progn
+     (InjectSnapshots)
+     (CallWithSnapshotInterval (main dummy) 200000)
+)
+"#;
+    file.write_all(prelude.as_bytes())?;
+    file.write_all(metta_code.as_bytes())?;
+    file.write_all(main_wrapper.as_bytes())
+}
+
+///// TESTS /////
 
 #[cfg(test)]
 mod tests {
